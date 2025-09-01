@@ -9,26 +9,6 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 // HashedSortGroup
 //===--------------------------------------------------------------------===//
-// Formerly PartitionGlobalHashGroup
-class HashedSortGroup {
-public:
-	using Orders = vector<BoundOrderByNode>;
-	using Types = vector<LogicalType>;
-
-	HashedSortGroup(ClientContext &client, optional_ptr<Sort> sort, idx_t group_idx);
-
-	const idx_t group_idx;
-
-	//	Sink
-	optional_ptr<Sort> sort;
-	unique_ptr<GlobalSinkState> sort_global;
-
-	//	Source
-	atomic<idx_t> tasks_completed;
-	unique_ptr<GlobalSourceState> sort_source;
-	unique_ptr<ColumnDataCollection> sorted;
-};
-
 HashedSortGroup::HashedSortGroup(ClientContext &client, optional_ptr<Sort> sort, idx_t group_idx)
     : group_idx(group_idx), sort(sort), tasks_completed(0) {
 	if (sort) {
@@ -485,7 +465,8 @@ SinkCombineResultType HashedSort::Combine(ExecutionContext &context, OperatorSin
 class HashedSortMaterializeTask : public ExecutorTask {
 public:
 	HashedSortMaterializeTask(Pipeline &pipeline, shared_ptr<Event> event, const PhysicalOperator &op,
-	                          HashedSortGroup &hash_group, idx_t tasks_scheduled);
+	                          HashedSortGroup &hash_group, idx_t tasks_scheduled,
+	                          optional_ptr<HashedSortCallback> callback);
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override;
 
@@ -497,13 +478,14 @@ private:
 	Pipeline &pipeline;
 	HashedSortGroup &hash_group;
 	const idx_t tasks_scheduled;
+	optional_ptr<HashedSortCallback> callback;
 };
 
 HashedSortMaterializeTask::HashedSortMaterializeTask(Pipeline &pipeline, shared_ptr<Event> event,
                                                      const PhysicalOperator &op, HashedSortGroup &hash_group,
-                                                     idx_t tasks_scheduled)
+                                                     idx_t tasks_scheduled, optional_ptr<HashedSortCallback> callback)
     : ExecutorTask(pipeline.GetClientContext(), std::move(event), op), pipeline(pipeline), hash_group(hash_group),
-      tasks_scheduled(tasks_scheduled) {
+      tasks_scheduled(tasks_scheduled), callback(callback) {
 }
 
 TaskExecutionResult HashedSortMaterializeTask::ExecuteTask(TaskExecutionMode mode) {
@@ -516,6 +498,9 @@ TaskExecutionResult HashedSortMaterializeTask::ExecuteTask(TaskExecutionMode mod
 	sort.MaterializeColumnData(execution, input);
 	if (++hash_group.tasks_completed == tasks_scheduled) {
 		hash_group.sorted = sort.GetColumnData(input);
+		if (callback) {
+			callback->OnSortedGroup(hash_group);
+		}
 	}
 
 	event->FinishTask();
@@ -528,18 +513,21 @@ TaskExecutionResult HashedSortMaterializeTask::ExecuteTask(TaskExecutionMode mod
 // Formerly PartitionMergeEvent
 class HashedSortMaterializeEvent : public BasePipelineEvent {
 public:
-	HashedSortMaterializeEvent(HashedSortGlobalSinkState &gstate, Pipeline &pipeline, const PhysicalOperator &op);
+	HashedSortMaterializeEvent(HashedSortGlobalSinkState &gstate, Pipeline &pipeline, const PhysicalOperator &op,
+	                           optional_ptr<HashedSortCallback> callback);
 
 	HashedSortGlobalSinkState &gstate;
 	const PhysicalOperator &op;
+	optional_ptr<HashedSortCallback> callback;
 
 public:
 	void Schedule() override;
 };
 
 HashedSortMaterializeEvent::HashedSortMaterializeEvent(HashedSortGlobalSinkState &gstate, Pipeline &pipeline,
-                                                       const PhysicalOperator &op)
-    : BasePipelineEvent(pipeline), gstate(gstate), op(op) {
+                                                       const PhysicalOperator &op,
+                                                       optional_ptr<HashedSortCallback> callback)
+    : BasePipelineEvent(pipeline), gstate(gstate), op(op), callback(callback) {
 }
 
 void HashedSortMaterializeEvent::Schedule() {
@@ -559,37 +547,13 @@ void HashedSortMaterializeEvent::Schedule() {
 		hash_group->sort_source = sort.GetGlobalSourceState(client, global_sink);
 		const auto tasks_scheduled = MinValue<idx_t>(num_threads, hash_group->sort_source->MaxThreads());
 		for (idx_t t = 0; t < tasks_scheduled; ++t) {
-			merge_tasks.emplace_back(
-			    make_uniq<HashedSortMaterializeTask>(*pipeline, shared_from_this(), op, *hash_group, tasks_scheduled));
+			merge_tasks.emplace_back(make_uniq<HashedSortMaterializeTask>(*pipeline, shared_from_this(), op,
+			                                                              *hash_group, tasks_scheduled, callback));
 		}
 	}
 
 	SetTasks(std::move(merge_tasks));
 }
-
-//===--------------------------------------------------------------------===//
-// HashedSortGlobalSourceState
-//===--------------------------------------------------------------------===//
-class HashedSortGlobalSourceState : public GlobalSourceState {
-public:
-	using HashGroupPtr = unique_ptr<ColumnDataCollection>;
-
-	HashedSortGlobalSourceState(ClientContext &client, HashedSortGlobalSinkState &gsink) {
-		if (!gsink.count) {
-			return;
-		}
-		hash_groups.resize(gsink.hash_groups.size());
-		for (auto &hash_group : gsink.hash_groups) {
-			if (!hash_group) {
-				continue;
-			}
-			const auto group_idx = hash_group->group_idx;
-			hash_groups[group_idx] = std::move(hash_group->sorted);
-		}
-	}
-
-	vector<HashGroupPtr> hash_groups;
-};
 
 //===--------------------------------------------------------------------===//
 // HashedSort
@@ -619,8 +583,9 @@ void HashedSort::GenerateOrderings(Orders &partitions, Orders &orders,
 
 HashedSort::HashedSort(ClientContext &client, const vector<unique_ptr<Expression>> &partition_bys,
                        const vector<BoundOrderByNode> &order_bys, const Types &input_types,
-                       const vector<unique_ptr<BaseStatistics>> &partition_stats, idx_t estimated_cardinality)
-    : client(client), estimated_cardinality(estimated_cardinality), payload_types(input_types) {
+                       const vector<unique_ptr<BaseStatistics>> &partition_stats, idx_t estimated_cardinality,
+                       optional_ptr<HashedSortCallback> callback)
+    : client(client), estimated_cardinality(estimated_cardinality), payload_types(input_types), callback(callback) {
 	GenerateOrderings(partitions, orders, partition_bys, order_bys, partition_stats);
 
 	// The payload prefix is the same as the input schema
@@ -663,18 +628,9 @@ unique_ptr<LocalSinkState> HashedSort::GetLocalSinkState(ExecutionContext &conte
 	return make_uniq<HashedSortLocalSinkState>(context, *this);
 }
 
-unique_ptr<GlobalSourceState> HashedSort::GetGlobalSourceState(ClientContext &context, GlobalSinkState &sink) const {
-	return make_uniq<HashedSortGlobalSourceState>(client, sink.Cast<HashedSortGlobalSinkState>());
-}
-
-unique_ptr<LocalSourceState> HashedSort::GetLocalSourceState(ExecutionContext &context,
-                                                             GlobalSourceState &gstate) const {
-	return make_uniq<LocalSourceState>();
-}
-
-vector<HashedSort::HashGroupPtr> &HashedSort::GetHashGroups(GlobalSourceState &gstate) const {
-	auto &gsource = gstate.Cast<HashedSortGlobalSourceState>();
-	return gsource.hash_groups;
+vector<HashedSort::HashGroupPtr> &HashedSort::GetHashGroups(GlobalSinkState &gstate) const {
+	auto &gsink = gstate.Cast<HashedSortGlobalSinkState>();
+	return gsink.hash_groups;
 }
 
 SinkFinalizeType HashedSort::MaterializeHashGroups(Pipeline &pipeline, Event &event, const PhysicalOperator &op,
@@ -688,11 +644,14 @@ SinkFinalizeType HashedSort::MaterializeHashGroups(Pipeline &pipeline, Event &ev
 		if (!unsorted.Count()) {
 			return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
 		}
+		if (callback) {
+			callback->OnSortedGroup(hash_group);
+		}
 		return SinkFinalizeType::READY;
 	}
 
 	// Schedule all the sorts for maximum thread utilisation
-	auto sort_event = make_shared_ptr<HashedSortMaterializeEvent>(gsink, pipeline, op);
+	auto sort_event = make_shared_ptr<HashedSortMaterializeEvent>(gsink, pipeline, op, callback);
 	event.InsertEvent(std::move(sort_event));
 
 	return SinkFinalizeType::READY;

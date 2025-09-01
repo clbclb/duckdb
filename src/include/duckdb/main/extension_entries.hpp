@@ -94,6 +94,7 @@ static constexpr ExtensionFunctionEntry EXTENSION_FUNCTIONS[] = {
     {"array_reverse_sort", "core_functions", CatalogType::SCALAR_FUNCTION_ENTRY},
     {"array_slice", "core_functions", CatalogType::SCALAR_FUNCTION_ENTRY},
     {"array_sort", "core_functions", CatalogType::SCALAR_FUNCTION_ENTRY},
+    {"my_array_sort", "core_functions", CatalogType::SCALAR_FUNCTION_ENTRY},
     {"array_to_json", "json", CatalogType::SCALAR_FUNCTION_ENTRY},
     {"array_transform", "core_functions", CatalogType::SCALAR_FUNCTION_ENTRY},
     {"array_unique", "core_functions", CatalogType::SCALAR_FUNCTION_ENTRY},

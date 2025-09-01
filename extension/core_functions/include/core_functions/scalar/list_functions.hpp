@@ -139,6 +139,12 @@ struct ArraySortFun {
 	static constexpr const char *Name = "array_sort";
 };
 
+struct MyArraySortFun {
+	using ALIAS = ListSortFun;
+
+	static constexpr const char *Name = "my_array_sort";
+};
+
 struct ListGradeUpFun {
 	static constexpr const char *Name = "list_grade_up";
 	static constexpr const char *Parameters = "list";
