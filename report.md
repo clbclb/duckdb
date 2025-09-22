@@ -34,4 +34,4 @@ DUCKDB_SCALAR_FUNCTION_SET_ALIAS(MyArraySortFun),
 
 测试：
 
-![alt text](3.png)
+![](/pitcture/3.png)
